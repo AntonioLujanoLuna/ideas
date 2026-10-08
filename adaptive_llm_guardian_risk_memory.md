@@ -6,7 +6,7 @@
 
 ## 1. Idea summary
 
-Build a **self-hosted security middleware** in front of the existing gateway's vLLM routing. A compact classifier flags prompt injection and similar threats; deterministic controls enforce identities, permissions, resource limits and sensitive-data boundaries. Suspicious or uncertain cases can query a dedicated **risk memory** in Elasticsearch containing *verified attacks and benign lookalikes*. Reviewed incidents improve detection and eventually train a smaller company-specific classifier.
+Build a **self-hosted security layer** ahead of vLLM routing. Evaluate **[CerbIA](https://github.com/InditexTech/cerbia)** as the configurable scanning and verdict pipeline, pairing inexpensive rules with optional local ML. The gateway and tool executors independently enforce permissions, limits and egress restrictions. Ambiguous events consult an Elasticsearch **risk memory** of *verified attacks and benign lookalikes*. Reviewed incidents help calibrate detectors and eventually train a compact company-specific model.
 
 **Four architectural rules:**
 
@@ -15,7 +15,7 @@ Build a **self-hosted security middleware** in front of the existing gateway's v
 3. **Never delegate authorization to a model.** Tool execution, cross-tenant retrieval, network egress and quotas require hard policy checks.
 4. **Learn only from verified evidence.** Automated promotion of attacker-submitted prompts poisons the risk database and training loop.
 
-**Initial recommendation:** Benchmark [Prompt Armor](https://github.com/prompt-armor/prompt-armor) as a possible foundation versus a simpler ONNX-based detector. Use [PIGuard](https://github.com/leolee99/PIGuard)'s overdefense evaluation methods and [Vigil](https://github.com/deadbits/vigil-llm)'s hybrid/vector scanning as design references. Target **<30 ms p95 added latency for routine short requests** as an experimental SLO, not a claimed result.
+**Initial recommendation:** Prototype **CerbIA as the orchestration layer**, and benchmark its lightweight rules-only and optional ProtectAI detection configurations against **[Prompt Armor](https://github.com/prompt-armor/prompt-armor)** and a minimal ONNX baseline. Use [PIGuard](https://github.com/leolee99/PIGuard) for overdefense tests and [Vigil](https://github.com/deadbits/vigil-llm) for historical hybrid/vector-scanning patterns. Target **<30 ms p95 added latency on short requests** as an experimental SLO, not a published CerbIA result.
 
 ## 2. Proposed architecture
 
@@ -28,13 +28,12 @@ Claude Code / Copilot / Cursor / portal agents
                    |
                    v
          Incremental input inspection
-           /                    \
-     Deterministic          Small classifier
-     policy checks          (CPU / ONNX)
-           \                    /
-            \                  /
-             v                v
-                  Policy engine
+                    |
+            CerbIA scan pipeline
+       deobfuscation / fast rules /
+       optional local ML classifier
+                    |
+     Gateway policy / verdict evaluator
                /       |       \
             allow   uncertain  block
               |        |         |
@@ -58,14 +57,14 @@ Async only: event -> security review -> verified labels
            -> risk index -> evaluation / fine-tuning
 ```
 
-This design fits the current H100 + 2×H200 Qwen deployment without allocating another large decoder to a GPU. Put the guardian near the gateway; llm-d still performs load/prefix-cache-aware model routing. Existing Elasticsearch infrastructure can host a **separately permissioned** risk index.
+This fits the current H100 + 2×H200 Qwen deployment without allocating another large decoder to a GPU. Run CerbIA in a gateway-local Python 3.12+ process or a dedicated internal service; its documented `SecurityGate.scan()` API supports programmatic integration. CerbIA returns scan findings/verdicts, while **the gateway remains the final policy authority**. llm-d still handles cache-aware model routing. Keep the Elasticsearch risk index **separately permissioned**. CerbIA does *not* document built-in vector risk memory or agent-execution authorization: those remain our components.
 
 ### Request handling
 
 - Assign provenance and trust metadata at a server-controlled boundary: `user`, `repository_file`, `retrieved_chunk`, `tool_result`, `tool_call`, `model_output`. Do not trust client-supplied role labels.
 - Inspect only **new or modified segments** in long conversations. Chunk long content with overlap; never silently treat a truncated scan as safe.
-- Run inexpensive deterministic checks and a compact classifier; cache *features* keyed by content hash, provenance, detector version and preprocessing. **Always re-evaluate current authorization.**
-- Allow, block, or escalate using a versioned policy. Consult Elasticsearch only for borderline/suspicious cases.
+- Use CerbIA's configurable loaders/preprocessors/scanners and optional local ProtectAI classifier. Start with selective fast checks (e.g. instruction patterns, secrets, URLs, invisible text). Cache *features* keyed by content hash, provenance, scanner versions and preprocessing. **Always re-evaluate current authorization.**
+- Configure CerbIA scanner actions, score aggregation, thresholds and scanner-error behavior explicitly; a safe verdict is **not** authorization. The gateway implements `allow / escalate / block`, consulting Elasticsearch only for borderline/suspicious cases.
 - For high-impact agent actions, enforce policy **where the tool executes**, including client-side tools invisible to the model gateway.
 - Inspect selected responses **before releasing** sensitive content. A scan after streaming cannot retract leaked bytes.
 
@@ -92,11 +91,12 @@ The guardian detects textual signals most directly for **LLM01** and some disclo
 
 | Project | How it works / what to reuse | License and limitations |
 | --- | --- | --- |
-| **[Prompt Armor](https://github.com/prompt-armor/prompt-armor)** | Parallel regex, DeBERTa ONNX, contrastive vector similarity, structural checks and anomaly scoring, followed by score fusion; closest match to this design. Candidate to **extend instead of rebuilding**. | **Apache 2.0** for repository; project-reported latency/accuracy need independent validation. Audit bundled models, dependencies, benchmark leakage, and operational maturity. |
+| **[CerbIA](https://github.com/InditexTech/cerbia)** | **First framework candidate:** configurable gates with loaders, deobfuscation/preprocessors, security scanners, score aggregation and verdicts; optional local ProtectAI and Presidio integrations. Wrap at the GW, with external risk memory and policy enforcement. | **Apache 2.0** repo, Python 3.12+; newly released, no validated enterprise latency benchmark or built-in risk memory. Audit scanner configuration, scoring, failure modes, and optional model licenses. |
+| **[Prompt Armor](https://github.com/prompt-armor/prompt-armor)** | **Detection benchmark/alternative:** parallel regex, DeBERTa ONNX, contrastive similarity, structural and anomaly scoring. Consider as CerbIA-integrated detector only if measured benefits justify complexity. | **Apache 2.0** for repository; reported latency/accuracy require independent validation. Audit model/dependency licenses, benchmark leakage and maturity. |
 | **[Vigil](https://github.com/deadbits/vigil-llm)** | Modular prompt/response scanner with YARA, transformers, vector similarity, optional updating, canary and other detectors. Useful prior art for security signatures and risk memory. | **Apache 2.0**; upstream explicitly calls it **experimental/alpha**, so treat as a reference rather than an unreviewed production dependency. Not the unrelated Vigil AI-SOC product. |
 | **[PIGuard](https://github.com/leolee99/PIGuard)** | Prompt-injection model and *NotInject* benign-trigger-word dataset designed to reduce **overdefense**, particularly valuable for developers discussing exploits and security concepts. | Repository **MIT**; verify model-weight, training-data and dependency terms separately. Benchmark short-text accuracy/latency and unknown attack families. |
 
-**Evaluation order:** Start with Prompt Armor and a minimal single-model ONNX baseline. Test PIGuard alongside the baseline for reduced false positives. Borrow useful Vigil techniques selectively. None provides the full OWASP authorization/egress protection needed for agents.
+**Evaluation order:** (1) CerbIA rules-only, (2) CerbIA + optional ProtectAI, (3) Prompt Armor standalone and/or a minimal ONNX detector. Compare the security/latency tradeoff on the same held-out traffic before integrating Prompt Armor into CerbIA. Use PIGuard for false-positive testing and Vigil as reference material. **None substitutes for tool authorization, ACLs or egress controls.**
 
 Other model baselines: [Prompt Guard 2 22M](https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-22M) or [86M](https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-86M) (Llama 4 Community License, review for corporate use), and [ProtectAI DeBERTa v3](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) (Apache 2.0, narrower scope). Commercial use of Liquid d1-3B may require a separate agreement under the LFM license: do not make it the default.
 
@@ -130,10 +130,10 @@ Optimize per-category thresholds on **held-out attack families and benign develo
 
 To control overhead:
 
-- Run warmed, CPU-hosted ONNX inference near the gateway first. Compare GPU only if measured CPU throughput fails.
+- Start with warmed CerbIA fast scanners in a gateway-local Python service; enable optional CPU-hosted ML/ONNX only if it improves held-out recall sufficiently. Compare GPU only if measured CPU throughput fails.
 - Reuse classifier *features* for repeated exact segments; never reuse a previous user's permission decision.
 - Keep ANN retrieval **conditional**. Deduplicate or cluster repeated reviewed attacks.
-- Isolate worker pools, bound queue length and fail safely under guardian outages. High-risk tool actions should fail closed; lower-risk read-only requests may follow an explicitly documented degraded-mode policy with audit.
+- Isolate worker pools, bound queue length and test CerbIA scanner errors, configuration-dependent `WARN` versus `BLOCK` handling, and aggregation behavior. High-risk tool actions should fail closed; lower-risk read-only requests may follow an explicitly documented degraded-mode policy with audit.
 - Avoid blocking security researchers for merely quoting attacks. Inspect **intent, provenance and requested operation**.
 
 Evaluate with genuine coding tasks, GitLab READMEs, RAG/tool-result injection, Jira/MCP misuse, exfiltration attempts, Spanish/English prompts, obfuscations, long context and benign security explanations. Key metrics: unseen-family recall, false blocks per 1,000 benign developer requests, escalation rate, precision/calibration, p95/p99 latency, and unauthorized actions actually prevented.
@@ -143,14 +143,17 @@ Evaluate with genuine coding tasks, GitLab READMEs, RAG/tool-result injection, J
 | Phase | Deliverable | Exit criterion |
 | --- | --- | --- |
 | **0. Threat model** | Inventory gateway visibility, source trust, agent tool execution, licenses and representative labeled cases | Owners and hard controls mapped to OWASP |
-| **1. Shadow guardian** | Deterministic checks + CPU classifier + incremental chunking + versioned events | Measured latency and false-positive/recall baseline |
+| **1. Shadow guardian** | CerbIA rules-only / CerbIA+ML / Prompt Armor or ONNX baseline; incremental chunks and versioned events | Comparative latency, error handling, false-positive and recall baseline |
 | **2. Risk memory** | Isolated Elasticsearch indexes, reviewed attacks and benign negatives, conditional retrieval | Demonstrated accuracy benefit for acceptable retrieval overhead |
 | **3. Agent enforcement** | Hooks in LangGraph/Copilot SDK tool dispatch and local executor, per-user authorization, DLP | Unsafe actions blocked at execution/egress boundaries |
 | **4. Adaptive student** | Reviewed training corpus, compact-model tuning, recalibration, canary and rollback | Improved security/latency tradeoff on independent data |
 
-Start with **Phase 1**, using Prompt Armor versus a simple ONNX baseline in shadow mode. Do not commit to building a custom vector-heavy engine before these measurements.
+Start with **Phase 1**: adopt CerbIA only if its framework overhead and detection quality justify it against simpler alternatives. Do not commit to a custom vector-heavy engine before the benchmarks. CerbIA is young: review production readiness and pin/verify the version.
 
-## 8. Links to existing infrastructure proposals
+## 8. References and related infrastructure
+
+- [CerbIA repository](https://github.com/InditexTech/cerbia) and [architecture / scanner documentation](https://inditextech.github.io/cerbia/latest/main/components/scanners/)
+- [CerbIA configurable gate behavior](https://inditextech.github.io/cerbia/latest/main/gate/)
 
 - [llm-d cache-aware vLLM routing](./llm_d_cache_aware_vllm_routing.md)
 - [Path-multiplexed vLLM replicas](./llm_d_path_multiplexed_vllm_replicas.md)
