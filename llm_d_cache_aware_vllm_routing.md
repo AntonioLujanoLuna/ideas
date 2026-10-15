@@ -374,3 +374,166 @@ Match \`CHUNK_SIZE\` to vLLM \`--max-num-batched-tokens\`, keep FP8 KV, model re
 - [Endpoint discovery schema, IPv4 constraints and network requirements](https://github.com/llm-d/llm-d-router/blob/main/docs/discovery.md)
 - [EPP metric definitions](https://github.com/llm-d/llm-d-router/blob/main/docs/metrics.md)
 - [Prefill throughput calibration](https://github.com/llm-d/llm-d/blob/main/guides/recipes/router/calibration/README.md)
+
+
+## 11. Precise prefix cache, CPU offloading, and hybrid Qwen: feasibility review
+
+**Reviewed:** 2026-10-15. **Status:** design option / conditional next phase, **not** a validated drop-in implementation. This section reviews a proposed precise-prefix architecture for TP=1 Qwen3.8-27B-FP8 on H100 + 2×H200, 262k max context, FP8 KV, MTP speculative decoding and long-running coding agents. The intended future scale is about 300 developers, not 300 simultaneously active requests.
+
+### 11.1 Decision
+
+**Do not replace the optimized-baseline rollout in §10 with precise prefix routing immediately.** First fix 70/30/0, verify three independent replica identities, benchmark approximate affinity and H100/H200 load. Next validate native CPU KV offloading **on one replica** with actual Qwen hybrid-state reuse. Only if the observed routing errors are material should precise indexing and extra ZMQ infrastructure be deployed.
+
+| Capability | Supported / qualified finding |
+| --- | --- |
+| Approximate prefix routing | Learns cache placement from past routing, not real vLLM residency; works with existing HTTP-only network |
+| Precise KV routing | Real event-driven block index and exact token rendering; requires per-replica ZMQ event transport plus replay/recovery |
+| CPU KV offload | Native vLLM \`OffloadingConnector\` can extend a local replica's usable prefix cache; works independently of precise routing |
+| Precise CPU event indexing | \`self_describing_kv_events\` is opt-in for native offloading; emitted metadata has documented limitations, including independently unretrievable CPU sub-chunks |
+| Tier-aware precise scoring | Architecture docs describe media and defaults \`gpu=1.0\`, \`cpu=0.8\`; **do not assume the proposed \`mediumWeights\` YAML field is supported** or that end-to-end hybrid-aware cache scoring is production-ready |
+| H100/H200 heterogeneity | Precise locality alone does not normalize by accelerator throughput or queue capacity |
+| Two active-active EPP replicas | **Not safe by default** with current reference token-load accounting and index replay semantics |
+| P2P remote CPU KV sharing | Separate experimental design path, not enabled by KV events, exact rendering or local OffloadingConnector alone |
+
+### 11.2 Why the original proposed precise EPP YAML is not deployable
+
+The actual upstream **precise-routing** guide builds on the optimized baseline; its plugin chain uses \`token-producer\`, \`endpoint-notification-source\`, \`precise-prefix-cache-producer\`, \`inflight-load-producer\`, \`prefix-cache-affinity-filter\`, and \`token-load-scorer\`. The deployed scheduling profile contains **only** the affinity filter and token-load scorer, not \`precise-prefix-cache-scorer\`, \`load-aware-scorer\`, \`max-score-picker\`, \`single-profile-handler\` or arbitrary weighted scoring from the draft.
+
+Reference excerpt **only** (not a complete EPP YAML; the standalone file-discovery adaptation remains implementation work):
+
+\`\`\`yaml
+plugins:
+  - type: token-producer
+    parameters:
+      modelName: Qwen/Qwen3-32B
+      vllm:
+        endpointDiscovery: {}
+        messagesRenderMode: auto
+        responsesRenderMode: auto
+  - type: endpoint-notification-source
+  - type: precise-prefix-cache-producer
+    parameters:
+      tokenProcessorConfig:
+        blockSizeTokens: 64
+        hashAlgorithm: xxh64
+      speculativeIndexing: true
+      indexerConfig:
+        kvBlockIndexConfig:
+          enableMetrics: true
+      kvEventsConfig:
+        engineType: vllm
+        topicFilter: "kv@"
+        concurrency: 8
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5556
+          replaySocketPort: 5559
+  - type: inflight-load-producer
+    parameters:
+      prefixMatchInfoProducerName: precise-prefix-cache-producer
+  - type: prefix-cache-affinity-filter
+    parameters:
+      prefixMatchInfoProducerName: precise-prefix-cache-producer
+      peakPrefillThroughput: 15926
+  - type: token-load-scorer
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: prefix-cache-affinity-filter
+      - pluginRef: token-load-scorer
+\`\`\`
+
+**All model IDs and the 15,926 tokens/s calibration above are upstream reference values for Qwen3-32B, H100 TP=2, and must be replaced/calibrated for this fleet.** \`discoverPods: true\` / \`endpointDiscovery: {}\` assume the documented Kubernetes model-server discovery integration, so **do not copy them into the present standalone Podman/file-discovery EPP as if they worked**. Establish version-supported event-source discovery and render endpoint selection; retain the standalone data-layer wiring from §10 only after validating plugin dependencies. Upstream uses \`--enable-scale-out\` to expose \`/v1/*/render\` on supported vLLM model-server builds. These render requests can traverse HTTP shims, provided the rewrite and model identity are correct.
+
+**Hash caution:** internal router \`xxh64\` block keys need not equal vLLM's own APC hash algorithm \`sha256_cbor\`. What matters is exact rendered tokens, block semantics, coherent event chains, correct model identity and cache-group handling. Do not impose \`PYTHONHASHSEED\` equality as a generic requirement for all precise-index configurations; it is relevant to specific vLLM hashing/transfer setups. Use release-matched official examples, not guessed plugin or flag names.
+
+References: [precise router values](https://github.com/llm-d/llm-d/blob/main/guides/precise-prefix-cache-routing/router/precise-prefix-cache-routing.values.yaml), [model-server KV events/render flags](https://github.com/llm-d/llm-d/blob/main/guides/precise-prefix-cache-routing/modelserver/gpu/vllm/base/patch-vllm.yaml).
+
+### 11.3 Native CPU KV offloading: local usefulness versus router knowledge
+
+Sample **connector JSON**, adapted from the current vLLM offloading documentation. Confirm support in the **pinned** deployed vLLM image before setting this:
+
+\`\`\`json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "CPUOffloadingSpec",
+    "cpu_bytes_to_use": 100000000000,
+    "self_describing_kv_events": true
+  }
+}
+\`\`\`
+
+- Without event indexing, vLLM can still restore locally offloaded cache when subsequent requests reach the **same** replica. Do not confuse this with \`--cpu-offload-gb\` for model-weight offloading.
+- \`self_describing_kv_events\` defaults to \`false\`; setting it to \`true\` is useful **only with KV events enabled separately**, and is not a guarantee that every event represents a reusable unit. Default/fallback and tiering cases can still yield incomplete metadata.
+- **Correctness blocker to investigate:** [vLLM issue #57159](https://github.com/vllm-project/vllm/issues/57159) was open on 2026-10-15. Under \`blocks_per_chunk > 1\`, the connector may announce GPU-size sub-block hashes even when the CPU store retrieves only the full, larger chunk. A prefix that ends inside that CPU chunk may therefore be *advertised as a hit but fail retrieval*. Test partial-prefix divergence at every offload chunk boundary.
+- Published event \`medium\` and group metadata do not imply the current llm-d scoring path has verified tier-aware **hybrid** hit semantics. llm-d's [KV-indexer docs](https://github.com/llm-d/llm-d/blob/main/docs/architecture/kv-management/kv-indexer.md) describe tier weights (\`gpu=1.0\`, \`cpu=0.8\`) and characterize hybrid-attention-aware scoring as work in progress. Inspect the **specific EPP/indexer version's source and config schema** before trying to override weights.
+- For a first CPU-tier proof, leave event-based precise routing off; prove actual CPU store/load and restoration with one directly addressed vLLM instance, then benchmark two independent H200 replicas with isolated tiers.
+
+Reference: [vLLM KV offloading usage](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md).
+
+### 11.4 Hybrid attention and realistic transfer costs
+
+The Qwen model combines full-attention KV with Gated DeltaNet / linear-attention state. A block-level event about **full-attention KV alone** does not establish that the recurrent state necessary to resume at a particular prefix boundary is restored. Prefix caching/offloading requires correct cache groups and valid state checkpoints across all relevant layers.
+
+The preliminary ~3 GB estimate for a 95k-token full-attention prefix is **not** a measured host↔device copy size for the entire hybrid cache. The often-quoted 60–80 ms CPU reload must **not** be adopted as an SLO or benchmark result: PCIe transfers, pinned-memory pressure, DMA overlap, CPU NUMA locality, offload-chunk granularity, scheduling, and recurrent-state restoration all contribute. Validate with GPU and CPU tiers independently and report p50/p95 TTFT and total CPU restore latency.
+
+Critical regression cases using the *same pinned Qwen3.8 FP8 weights, 262k context, FP8 KV and MTP settings*:
+
+1. Repeated prompt fully resident in GPU cache: verify actual APC hits and correct generated continuation.
+2. Long prompt after forcing GPU eviction but while CPU cache retains its prefix: verify **external-cache hit/load counters**, prompt tokens recomputed and latency.
+3. Prefix that diverges midway through an offload chunk: ensure no false reusable-prefix claims.
+4. Recurrent-state/hybrid-group boundary changes, evictions and restarts: check output equivalence and whether warmup is required.
+5. Mix short and 50k–200k agentic prompts at increasing concurrency; compare offloading on/off and routing strategies.
+
+Do not assume fixed \`--max-num-seqs 32\`, \`--block-size 64\`, or CPU offload size are universally valid for the model and vLLM release. Use observed max concurrency and group-specific block requirements.
+
+### 11.5 Network and EPP high availability
+
+**Today's connectivity limitation:** the H200 server exposes **one external HTTP listener**, \`H200_HOST:9080\`, with paths \`/modelA/\` and \`/modelB/\`; gateway-local shims (\`18001\` and \`18002\`) preserve independent HTTP endpoints. **Ordinary Nginx HTTP location rewriting cannot forward raw ZMQ streams by URL path.**
+
+A precise deployment must obtain separately reachable, identity-stable **KV-event** and **replay** TCP sockets per vLLM process, e.g. a pair of restricted private ports per replica, TCP \`stream\` proxies with independently bound gateway listeners, or an approved tunnel/relay. These transports require security approval, socket-level health/reconnect handling and topic/index identity mapping. Merely setting \`endpoint: tcp://*:5557\` and a model topic is insufficient. The pinned upstream guide uses **5556 (events), 5559 (replay)** and event topics incorporating each worker's inference endpoint. Ensure the router can discover and subscribe to both H200 processes **despite their shared :9080 HTTP entrypoint**.
+
+**Start with one EPP:** upstream explicitly fixes \`router.epp.replicas: 1\` for its precise guide. In-flight token accounting is process-local, and a newly started index may have a replay window too short to reconstruct all warm cache. Two routers subscribing to the same events does not automatically yield consistent index history, complete recovery, or accurate global load. Active-active would require shared or reconciled in-flight state and verifiable full-index recovery (current snapshot support is experimental), plus an HA plan for Envoy/gateway.
+
+### 11.6 Memory and hardware-aware load balance
+
+Proposing **100 GB of CPU KV on each H200** implies 200 GB of requested offload tier on their **shared host**, before vLLM process RSS, pinned buffers, \`/dev/shm\`, any other workload, and OS headroom. A machine with 200–250 GB host RAM may be at significant OOM/swap risk. Start with a smaller tier per replica; measure \`MemAvailable\`, RSS, page faults, NUMA locality and connector store/load counters. Host memory allocation and CPU tier sizing must be considered **per host**, not per GPU in isolation.
+
+Precise routing by itself may **reinforce the existing 70/30/0 H100 preference** if that worker genuinely holds the longest reused prefixes. Proper heterogeneous scheduling should approximate:
+
+\`\`\`text
+estimated_request_cost(endpoint) =
+    queue_wait(endpoint)
+  + cache_restore_time(endpoint, GPU/CPU/miss)
+  + uncached_prefill_tokens / measured_prefill_rate(endpoint)
+  + decode_congestion_penalty(endpoint)
+\`\`\`
+
+This is a *proposed cost function*, not an available built-in EPP plugin. The stock precise filter + token-load scorer is not proof of per-GPU performance normalization.
+
+### 11.7 Staged evaluation and acceptance gates
+
+| Stage | Change | Continue only if |
+| --- | --- | --- |
+| A | Complete §10 optimized baseline and correct the zero-traffic H200 | All three independent eligible endpoints; better aggregate tokens/s and tail latency without excessive cache-loss |
+| B | Run native CPU offload on one H200 directly, without precise routing | Verified real CPU-tier store **and** load, correct hybrid state, useful TTFT improvement and acceptable memory overhead |
+| C | Add tier-aware **approximate** policy to account for local CPU cache | Better TTFT or actual reuse on repeated multi-turn sessions versus B |
+| D | Pilot precise GPU-prefix event indexing with exact render and ZMQ/replay connectivity | Correct event identity/replay and lower wasted uncached prefill versus A |
+| E | Pilot CPU self-describing events and tier-aware precise routing, **only after issue and hybrid checks** | No false partial-chunk hits, correct state restoration, robust restart/recovery, useful improvement versus C |
+| F | Evaluate P2P cache transfer and active-active EPP separately | Transfer beats recompute under measured local network RTT/bandwidth, and state synchronization/HA is proven |
+
+For each experiment, record per-endpoint request distribution, **actual** cached tokens, in-flight work, queue wait, prefill tokens/s, decode tokens/s, p95/p99 TTFT/TPOT, cache store/load bytes, CPU/GPU memory pressure, errors, and EPP overhead. Replay the *same* multi-turn tool-using traces across variants, plus cold sessions and concurrency sweeps.
+
+**Production decision:** if the gap between approximate routing with CPU offload and precise routing with CPU offload is small, keep the simpler HTTP-only approximate design. Do not implement remote ZMQ, precise index recovery, or cross-node KV transfer without measured evidence that they improve the required service objectives.
+
+**Related upstream references:**
+- [Precise routing guide](https://github.com/llm-d/llm-d/blob/main/guides/precise-prefix-cache-routing/README.md)
+- [Precise EPP plugins](https://github.com/llm-d/llm-d/blob/main/guides/precise-prefix-cache-routing/router/precise-prefix-cache-routing.values.yaml)
+- [Tiered-prefix-cache guide](https://github.com/llm-d/llm-d/blob/main/guides/tiered-prefix-cache/README.md)
+- [Tiered CPU producer/scorer config](https://github.com/llm-d/llm-d/blob/main/guides/tiered-prefix-cache/router/single-host/tiered-prefix-cache-cpu.values.yaml)
+- [vLLM offloading connector](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md)
+- [vLLM offload event correctness issue #57159](https://github.com/vllm-project/vllm/issues/57159)
+- [KV-indexer architecture and hybrid warning](https://github.com/llm-d/llm-d/blob/main/docs/architecture/kv-management/kv-indexer.md)
