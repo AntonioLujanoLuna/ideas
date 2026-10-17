@@ -1,14 +1,14 @@
 # Cache-aware llm-d routing for the H100 and 2 × H200 vLLM nodes
 
 **Status:** implementation proposal  
-**Date:** 2026-10-01 (updated 2026-10-15)  
+**Date:** 2026-10-01 (updated 2026-10-17)  
 **Target:** existing gateway + one H100 host + one dual-H200 host, using Podman and Nginx without Kubernetes.
 
 ## 1. Objective and recommendation
 
 Introduce llm-d's **Endpoint Picker (EPP)** and **Envoy** *behind* the existing API gateway, preserving the current public interface, authentication, quotas and other gateway logic. EPP should select a vLLM endpoint using **prefix-cache affinity and load**, not simple round robin. Each vLLM process retains its **own local KV cache**; llm-d's router tracks or estimates where useful prefixes reside, but does **not** automatically transfer or share KV tensors.
 
-**Recommended rollout:** keep all three existing vLLM replicas independently reachable (H100, H200-A, H200-B); use Envoy + EPP with file-based discovery and **the newer optimized-baseline prefix-affinity filter + token-load scorer**; benchmark against the current policy; optionally enable precise cache indexing through vLLM KV events. Do not introduce Kubernetes, shared KV storage or prefill/decode disaggregation for this first deployment. See §10 for the observed 70/30/0 traffic skew and migration details.
+**Recommended rollout:** first validate Qwen3.8 hybrid APC with MTP (§12), then keep all three existing vLLM replicas independently reachable (H100, H200-A, H200-B); use Envoy + EPP with file-based discovery and **the newer optimized-baseline prefix-affinity filter + token-load scorer**; benchmark against the current policy; optionally enable precise cache indexing through vLLM KV events. Do not introduce Kubernetes, shared KV storage or prefill/decode disaggregation for this first deployment. See §10 for the observed 70/30/0 traffic skew and migration details.
 
 **Important prerequisite:** cache-aware balancing across both hosts assumes that both endpoints serve the **same model identity, weights, tokenizer, chat template and compatible prefix-cache hash semantics**. If H100 serves 27B and H200 serves a larger model, use separate named model pools and model-aware gateway routing. Do not silently substitute different models for an API request.
 
@@ -520,7 +520,7 @@ This is a *proposed cost function*, not an available built-in EPP plugin. The st
 | --- | --- | --- |
 | A | Complete §10 optimized baseline and correct the zero-traffic H200 | All three independent eligible endpoints; better aggregate tokens/s and tail latency without excessive cache-loss |
 | B | Run native CPU offload on one H200 directly, without precise routing | Verified real CPU-tier store **and** load, correct hybrid state, useful TTFT improvement and acceptable memory overhead |
-| C | Add tier-aware **approximate** policy to account for local CPU cache | Better TTFT or actual reuse on repeated multi-turn sessions versus B |
+| C | Approximate replica affinity with native local CPU KV offloading; this cannot authoritatively observe individual CPU-resident blocks | Measured CPU-tier restores and lower p95 TTFT, without assuming tier-precise information |
 | D | Pilot precise GPU-prefix event indexing with exact render and ZMQ/replay connectivity | Correct event identity/replay and lower wasted uncached prefill versus A |
 | E | Pilot CPU self-describing events and tier-aware precise routing, **only after issue and hybrid checks** | No false partial-chunk hits, correct state restoration, robust restart/recovery, useful improvement versus C |
 | F | Evaluate P2P cache transfer and active-active EPP separately | Transfer beats recompute under measured local network RTT/bandwidth, and state synchronization/HA is proven |
@@ -537,3 +537,107 @@ For each experiment, record per-endpoint request distribution, **actual** cached
 - [vLLM offloading connector](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md)
 - [vLLM offload event correctness issue #57159](https://github.com/vllm-project/vllm/issues/57159)
 - [KV-indexer architecture and hybrid warning](https://github.com/llm-d/llm-d/blob/main/docs/architecture/kv-management/kv-indexer.md)
+
+
+## 12. October 17 follow-up: cache correctness, intelligent routing and future peer-to-peer sharing
+
+**Decision:** retain 3 independent TP=1 Qwen3.8-27B FP8 replicas (H100 + H200-A + H200-B) as the initial production baseline. First resolve the observed **70/30/0** routing skew (§10); then prove prefix caching works with the deployed **Qwen3.8 + MTP-3** combination. Add local CPU KV offload and approximate load-aware prefix affinity next. Precise tier-aware routing and cross-server KV sharing are conditional, separately tested improvements. Do not replace this baseline with TP=2 or prefill/decode disaggregation until measurements justify it.
+
+### 12.1 Mandatory Qwen3.8 hybrid APC and MTP regression gate
+
+Qwen3.8 is a hybrid full-attention and Gated DeltaNet model: an apparent matched token prefix and stored attention blocks do **not** by themselves guarantee reusable recurrent state at an arbitrary boundary. Specifically:
+
+- [vLLM issue #54360](https://github.com/vllm-project/vllm/issues/54360), checked open on 2026-10-17, reports zero APC hits with speculation on a *specific nightly/NVFP4 deployment*. This is a **warning**, not proof that our FP8 deployment exhibits the issue.
+- [Issue #53504](https://github.com/vllm-project/vllm/issues/53504), closed, reports a first-repeat MTP/hybrid sparse-state retention mismatch on Qwen3.8 FP8. Retention workarounds and fixes are **version dependent**.
+- The cache retention mode (`align` and supported alternatives), speculative token count and vLLM commit can change valid prefix reuse boundaries.
+
+Use the same pinned model, chat template, tokenizer, FP8 KV, 262k context and request traces to compare:
+
+| Arm | APC | Speculation | Main measurement |
+| --- | --- | --- | --- |
+| A | Disabled | MTP-3 | Uncached prefill and decode baseline |
+| B | Enabled | None | Best achievable APC reuse |
+| C | Enabled | MTP-1 | Cache reuse and decoding versus B |
+| D | Enabled | MTP-3 | Current workload: actual reuse versus B/C |
+| E | Enabled | MTP-3 plus supported retention tuning | Only if D regresses; reproduce and validate fix |
+
+Replay a serialized identical ~20k–100k-token prompt at least three times, then 10–20 incremental agent turns where the long context grows. Record actual cached-token counts, `vllm:prefix_cache_hits_total` when exposed, p50/p95 TTFT, TPOT, prefix alignment and generated continuation. Also test partial divergence, GPU eviction, cold restart and real concurrent traffic. Never rely on one metric: a provider's `usage.cached_tokens` or routing prediction may disagree with genuine vLLM APC reuse.
+
+**Go/no-go:** if MTP-3 destroys cache reuse relative to no speculation, investigate the installed vLLM build and retention settings or turn MTP off until a verified fix exists. No routing algorithm can repair missing engine-side cache state.
+
+### 12.2 Native CPU offloading with real proof of restoration
+
+Use vLLM's `OffloadingConnector` / `CPUOffloadingSpec` / `kv_role=kv_both` independently on each replica. Start with `blocks_per_chunk=1` for hybrid-group compatibility and `eviction_policy=lru`; measure ARC separately. Consider around **80 GiB on H100 and 64 GiB per H200** only as initial test allocations; confirm free RAM, pinned allocations, NUMA and other services first. Two H200 processes on the same server share a single host RAM budget. This is prefix-state offload, **not** the `--cpu-offload-gb` flag for weights.
+
+- Start with `offload_prompt_only=true` (connector default). A/B against `false` because generated agent output may appear in subsequent prompts, but writing decode blocks can increase memory traffic and evictions.
+- Force cache pressure to evict a prefix from GPU while preserving it in CPU RAM. Verify nonzero **actual** external hits and loads, e.g. `vllm:external_prefix_cache_hits_total`, `vllm:kv_offload_load_bytes_total`, lower TTFT and correct output. Merely allocating DRAM or seeing GPU APC hits is not sufficient.
+- Test `store_threshold` and ARC only on unchanged multi-session traces. New experimental `kv_transfer_params.max_load_tokens` may cap per-request external restores; do not adopt it without validating version and load-versus-recompute behavior.
+- For *precise CPU-tier indexing*, `self_describing_kv_events=true` must be accompanied by enabled vLLM KV event publication. Event metadata is not a universal guarantee of independently retrievable hybrid chunks. In particular, inspect partial-chunk cases and [issue #57159](https://github.com/vllm-project/vllm/issues/57159) before using `blocks_per_chunk>1`.
+
+**Important distinction:** approximate prefix routing can track *which replica is likely to have served a prefix*, but **cannot authoritatively distinguish GPU-resident from CPU-resident blocks**. Local native CPU offloading may still substantially improve performance even with approximate routing.
+
+### 12.3 Make prompt serialization cache friendly and isolate tenants
+
+Automatic prefix caching requires an **exact shared initial token sequence**. In the corporate gateway and agent integrations:
+
+1. Preserve stable system prompts, tool schemas and repository instructions early in the prefix when semantics allow.
+2. Avoid placing volatile timestamps, request IDs, reordered tools, changing summaries and variable retrieval data before large stable prompt segments.
+3. Measure the longest common token-prefix length across successive agent calls and correlate it with **actual** cached tokens.
+4. Guarantee matching model weights, revision, tokenizer, template and compatible hash/configuration on all three backends.
+5. Use vLLM request `cache_salt` at the chosen security boundary. Assign/enforce a stable unpredictable salt from authenticated gateway identity; do not trust caller-supplied salt. Per-user isolation reduces cross-user reuse, whereas organizational sharing broadens reuse but weakens separation. Salt is a timing-side-channel mitigation, **not** a complete tenant security boundary. Verify llm-d routing hashes and later P2P transfers respect salts.
+
+Reference: [vLLM security documentation](https://docs.vllm.ai/en/latest/usage/security/).
+
+### 12.4 Hardware-aware routing: what is stock and what is custom
+
+The supported initial standalone llm-d route uses **`approx-prefix-cache-producer`, `inflight-load-producer`, `prefix-cache-affinity-filter`, `token-load-scorer`** with the verified no-Kubernetes file-discovery setup in §10. Preserve the local Nginx shims (`:18001`, `:18002`) for distinct H200 endpoint identities.
+
+The load-aware choice should trade cached-prefix savings against queueing, CPU restore and decode disruption. A future custom model could use:
+
+```text
+predicted_latency(replica, request) =
+    estimated_queue_wait
+  + estimated_local_or_remote_KV_restore_time
+  + measured_uncached_prefill_time(remaining_tokens, gpu_type, load)
+  + decode_interference_penalty
+```
+
+The **longest actually restorable contiguous prefix** must be used, rather than a sum of disconnected indexed blocks. Enforce eligibility, KV headroom, model/security identity and queue limits before scoring. This formula is a **design proposal**, not an existing llm-d YAML plugin; current optimized-baseline defaults do not imply calibrated per-H100/H200 prefill/decode capacity.
+
+For each GPU class separately, measure cold and warm prefill tokens/s, throughput during concurrent decode, batch-size curves, queue delay, CPU restore GiB/s, active-sequence/KV limits and p95 TPOT. Calibrate token-aware routing on the measured capability of **each worker**, not a fixed 20/40/40 split. Prioritize per-developer admission control, sensible queued-prefill budgets and interactive-agent fairness in the gateway.
+
+### 12.5 Experimental peer-to-peer CPU KV sharing
+
+The experimental [llm-d P2P guide](https://github.com/llm-d/llm-d/blob/main/guides/p2p-kv-cache-sharing/README.md) describes remote CPU KV retrieval via NIXL/UCX, *in addition to* native offloading, precise cache indexing, P2P source discovery and a supported transfer tier. **Neither approximate affinity nor ordinary local `OffloadingConnector` enables remote sharing automatically.**
+
+Test only after a functioning precise index with correct hybrid and CPU-group semantics:
+
+1. Validate identical model/hashing/TP/cache-layout compatibility, tenant salts, source ownership and supported vLLM/NIXL versions.
+2. Obtain approved raw TCP/RDMA transports for event publication/replay and P2P. The dual-H200 server's **HTTP-only `:9080/modelA` and `/modelB` shim arrangement does not expose ZMQ or UCX**. Do not assume Nginx HTTP location routing carries binary protocols.
+3. Benchmark between H200 peers on the same server and H100 ↔ H200 on the inter-server network separately; measure actual achievable bandwidth, RTT, NUMA, copy/restore overhead and transferred bytes.
+4. Sweep 8k/16k/32k/64k/128k/200k cached-prefix sizes. The published `minCachedTokenDelta=2048` is reference-specific, **not** a measured Qwen3.8 threshold.
+5. A/B strict cache affinity, load-aware scheduling, load-aware with local CPU offload, and precise P2P placement under overloaded warm H100 / idle H200 conditions. Keep P2P only when transfer+restore beats recomputation/queueing and improves SLO goodput.
+
+Sanity check: this Qwen hybrid's **attention KV alone** is roughly 32 KiB/token (16 attention layers × K/V × 4 KV heads × 256 dimensions × 1 FP8 byte). A 64k-token prefix contains about **2 GiB of attention KV**, before recurrent state, metadata and transfer overhead. Its theoretical minimum over 10 Gb/s is ~1.7 seconds. Actual end-to-end NIXL transfer costs must be measured and could substantially differ. Do not use gpt-oss-120b H200 reference results to forecast Qwen3.8 performance.
+
+### 12.6 Precise indexing recovery and operational fallback
+
+The precise EPP index needs exact prompt rendering/tokenization and version-matched KV `BlockStored`, `BlockRemoved`, and reset events. Verify **cache group handling** because [llm-d's indexer docs](https://github.com/llm-d/llm-d/blob/main/docs/architecture/kv-management/kv-indexer.md) state hybrid-aware scoring is work in progress. ZMQ events, replay endpoints and replica identities must remain aligned through gateway shims; event replay has a finite buffer. The router must not treat stale or incomplete replay as an authoritative cache index.
+
+Start with one EPP unless correct global in-flight state and index synchronization are proven. On missing event streams, incomplete replay, wrong model/rendering or stale indices, **degrade to measured load-aware/approximate routing**. Preserve the known-good direct gateway-to-vLLM rollback.
+
+### 12.7 Rollout gates and evaluation
+
+| Stage | Change | Continue only when |
+| --- | --- | --- |
+| 0 | Correct 70/30/0 route and health (§10) | Three selectable, independently probed replicas with distinct metrics |
+| 1 | MTP/APC hybrid correctness (§12.1) | Actual multi-turn cache hits and verified continuations |
+| 2 | Approximate prefix + token-load EPP (§10) | SLO goodput/TTFT improvement versus current route |
+| 3 | Native CPU tier (§12.2) | Real CPU restore hits after HBM eviction; safe RAM budget |
+| 4 | Precise GPU and CPU index (§11, §12.6) | Exact rendering, replay, no false hybrid/partial-chunk hits |
+| 5 | Optional P2P sharing (§12.5) | End-to-end transfer beats recomputation and preserves TPOT |
+| 6 | Optional capacity-normalized scorer (§12.4) | Reproducible goodput/fairness improvement over stock routing |
+
+Run matched **open-loop arrival-rate sweeps** as well as concurrency sweeps, with cold 4k–262k prompts, growing 10–30-turn coding-agent histories, GPU→CPU eviction, simultaneous sessions, and hot-session contention. Record measured cached tokens by tier, prefill/decode throughput, GPU/CPU residency, queue wait, p95/p99 TTFT, TPOT, completion goodput, per-developer fairness and per-router processing latency. More raw tokens/s or a higher cache-hit ratio alone is **not** success.
+
+**Bottom line:** the optimal near-term result may be **correct MTP/APC + three load-aware replicas + native local RAM cache**. Precise indexing/P2P must earn their additional ZMQ, transfer, operational and security complexity by performance measurements.
