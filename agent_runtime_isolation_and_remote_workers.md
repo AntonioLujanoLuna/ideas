@@ -552,6 +552,14 @@ Failure policy:
 
 The main design choice still requiring benchmarking is **whether Copilot coding sessions are best treated as session-long isolated runtimes or whether some should run as trusted persistent agents invoking isolated tools**. Both patterns should remain supported.
 
+## 15.1 Ultra-light microVM tool sandbox prototype (2026-10-22)
+
+The first microVM implementation should **isolate untrusted tool execution without moving the full agent loop into the guest**. LangGraph/Copilot SDK remain in the trusted application runtime; shell, file writing, code and tests execute through a session-scoped `SandboxExecutionProvider` backed by a minimal KVM guest. This keeps tiny shell sandboxes separate from larger full-agent worker deployments.
+
+**Try Podman + crun/krun (libkrun) first**, then **Firecracker with virtio-vsock and per-VM writable storage** if stronger network isolation or stricter lifecycle control is required. Verify `/dev/kvm` permissions and **enforce network denial outside the VM**: libkrun's TSI networking can use the host's network context, and `--network=none` alone is not proof of denied egress. Benchmark real host memory consumption and start/warm command latency rather than assuming compressed image size equals runtime memory. Never silently downgrade to container isolation.
+
+The concrete smoke test, API contract, runtime alternatives, guest resource hypotheses, security gates and benchmark matrix are documented in **[ultralight_microvm_agent_tool_sandboxes_poc.md](ultralight_microvm_agent_tool_sandboxes_poc.md)**. This experiment precedes, and does not require, Kubernetes/Kata deployment.
+
 ## 16. Final recommendation
 
 Build the **Runtime Manager + Remote Worker API** before adding orchestration. Deploy one dedicated Podman host and retain local execution as an explicit trusted mode. Relocate the **whole Copilot SDK application** where true isolation is needed, rather than assuming that a remotely hosted headless CLI isolates SDK callbacks. Keep LangGraph's checkpointing and both frameworks' tool interfaces independent of container placement.
