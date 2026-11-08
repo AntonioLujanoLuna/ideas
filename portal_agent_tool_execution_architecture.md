@@ -2,6 +2,7 @@
 
 **Status:** Design proposal  
 **Scope:** LangGraph and GitHub Copilot SDK agents, centrally hosted web tools, client-side filesystem/spreadsheet operations, and sandboxed code execution.
+**Deployment requirement (confirmed 2026-11-08):** Search/metasearch, MCP servers, crawling, browser workers, caches, gateways and agent infrastructure must all run on organization-managed hosts. They MAY query external search engines and websites via the approved corporate proxy. No hosted web-search/crawling APIs or remote MCP services. Maintaining our own global web index is not required.
 
 ## 1. Objective
 
@@ -9,7 +10,7 @@ Provide a common set of tools to agents running in the portal without coupling a
 
 The portal already supports LangGraph and GitHub Copilot SDK agents, as well as server-side and client-side tools. Extend that infrastructure with:
 
-- **Centralized web research:** Search the public web and retrieve pages using an internally hosted MCP service whose outbound requests go through the corporate proxy.
+- **Centralized web research:** Search the public web and retrieve pages using an internally deployed Web Research Gateway, with an optional internally hosted MCP interface and outbound requests through the approved corporate proxy.
 - **Client-side operations:** Read and modify user-selected Excel workbooks, access explicitly authorized local files, and interact with local applications.
 - **Sandboxed code execution:** Execute generated code in an isolated environment, preferably on the client when the operation depends on local data.
 - **A shared tool registry and router:** Present consistent tool schemas to both agent frameworks while selecting the appropriate execution backend and enforcing permissions.
@@ -28,9 +29,11 @@ flowchart TB
 
     ROUTER -->|Server-side MCP| WEB[Internal web-research MCP]
     WEB --> SEARX[SearXNG]
-    WEB --> FETCH[Crawl4AI / HTML extractor]
+    WEB --> STATIC[HTTP + Trafilatura first-pass extraction]
+    WEB --> FETCH[Crawl4AI browser fallback]
     WEB --> PDF[Existing Docling pipeline]
     SEARX --> PROXY[Corporate HTTP/HTTPS proxy]
+    STATIC --> PROXY
     FETCH --> PROXY
     PROXY --> INTERNET[Public Internet]
 
@@ -51,7 +54,9 @@ Three distinct execution locations:
 
 The user-facing client normally connects to the **portal backend**, not directly to the centralized MCP. The backend controls agent sessions, authorization and tool dispatch.
 
-## 3. Web research through the corporate proxy
+## 3. Self-hosted web research through the corporate proxy
+
+**Interpretation of fully self-hosted:** The portal operates every service that agents invoke or depend on. In particular, hosted Brave/Exa/Parallel/Tavily/You.com search APIs, Firecrawl/Crawl4AI cloud offerings, public MCP endpoints and public SearXNG instances are not dependencies. **External search engines and public websites are permitted as outbound destinations.** SearXNG is a metasearch proxy, not our own web index: it forwards queries to configured engines, which may observe the originating corporate proxy and may rate-limit or challenge requests. Never send confidential prompts, sensitive data or internal document content as public search queries. Maintaining an independent/offline search index is out of scope.
 
 ### 3.1 Services
 
@@ -60,15 +65,17 @@ Deploy the following components on the backend's host/container network, or on r
 | Component | Purpose |
 | --- | --- |
 | Internal web MCP server | Exposes a stable agent-facing tool interface |
-| SearXNG | Metasearch with JSON results |
-| Lightweight HTML extractor / Crawl4AI | Converts retrieved pages to clean text or Markdown; handles complex pages when necessary |
+| SearXNG | Private metasearch service with JSON results from permitted external search engines |
+| HTTP fetch + Trafilatura | Lightweight, browser-free first-pass text/Markdown extraction, with source metadata |
+| Crawl4AI | Browser-based fallback for JavaScript-heavy or extraction-resistant pages |
 | Existing Docling pipeline | Processes fetched PDF documents |
-| Corporate proxy | Controls outbound HTTP/HTTPS traffic |
-| Optional cache | Reduces repeated search and retrieval traffic |
+| Corporate proxy | Controls outbound HTTP/HTTPS traffic from all services reaching the public web |
+| Optional private cache | Reduces repeated search and retrieval traffic with appropriate expiration policies |
+| Optional isolated Playwright browser workers | Interactive navigation only when ordinary search/extraction is insufficient |
 
 The MCP server itself need not have unrestricted Internet connectivity. The processes making external requests must be able to reach the corporate proxy, and the proxy must allow the required destinations.
 
-**Important:** A self-hosted MCP server and SearXNG do not create Internet access. SearXNG still queries external search engines. If the corporate proxy rejects those destinations, search will fail unless the relevant routes are approved or a different permitted search provider is selected.
+**Important:** A self-hosted gateway and SearXNG do not create Internet access. SearXNG still queries external search engines. If the corporate proxy blocks them, enable permitted engine routes or degrade gracefully; do not introduce a hosted search API as a fallback. Enable JSON explicitly in SearXNG's `search.formats` configuration; it may otherwise return HTTP 403 for JSON requests. Test permitted search engines for blocking, CAPTCHA, throttling and relevance.
 
 A representative SearXNG configuration:
 
@@ -86,7 +93,7 @@ outgoing:
       - http://proxy.internal:8080
 \`\`\`
 
-Configure the extractor's outbound HTTP client and browser proxy independently. Handle corporate proxy authentication and CA certificates in the environment's secret and trust stores; do not hardcode credentials into agent tools.
+Configure SearXNG, the HTTP fetcher and Crawl4AI/Playwright browser egress independently. All outbound public-web paths must traverse the approved proxy. Enforce egress restrictions at the network boundary, rather than trusting HTTP-client settings alone. Handle corporate proxy authentication and CA certificates in the environment's secret and trust stores; do not hardcode credentials into agent tools. Keep MCP and backend endpoints private.
 
 ### 3.2 Tool interface
 
@@ -99,7 +106,7 @@ Start with a small set of operations:
 | \`web_find\` | Previously fetched document ID, search pattern | Matching passages with locations |
 | \`browser\` (optional) | Navigation or interaction request | Page state and bounded interaction results |
 
-Use ordinary retrieval for most articles and documentation. Start a browser only for JavaScript-heavy or interactive sites. PDFs should go through the existing document-processing pipeline.
+Use HTTP fetch + Trafilatura for ordinary articles and documentation. Fall back to Crawl4AI's self-hosted rendering for JavaScript-heavy or extraction-resistant pages. Use separate isolated Playwright workers only for truly interactive navigation. PDFs should go through the existing document-processing pipeline. Do not launch a browser for every `web_fetch` call.
 
 Keep complete retrieved documents outside the LLM context where practical. Return bounded excerpts and let the agent request additional passages. Preserve source URLs and dates so answers can cite their evidence.
 
@@ -113,7 +120,28 @@ Keep complete retrieved documents outside the LLM context where practical. Retur
 - Cache search responses and fetched pages with separate, query-appropriate expiration policies.
 - Record provider failures, latency, cache hit rate and tool usage using the existing observability stack.
 
-An optional Brave Search API fallback can improve reliability if SearXNG is blocked or throttled, provided corporate egress and procurement policies permit it. Both options can implement the same \`web_search\` contract.
+No externally hosted search API is permitted as a fallback. If an engine throttles or blocks SearXNG, apply per-engine backoff, switch among approved engines, report partial failures and monitor coverage. The self-hosted gateway keeps the `web_search` contract stable while search engine configurations change.
+
+### 3.4 Implementation candidates reviewed in November 2026
+
+| Candidate | Fit | Decision |
+| --- | --- | --- |
+| **SearXNG + HTTP/Trafilatura + Crawl4AI** | Modular, minimizes unnecessary browser work and uses only self-hosted services | **Preferred reference architecture** |
+| **searxNcrawl + private SearXNG** | Ready-made self-hostable MCP for search, page crawling and site crawling | **Time-boxed PoC** as an alternative to custom MCP glue. Disable its optional You.com integration; audit auth, supply chain and network egress |
+| **Firecrawl self-hosted + private SearXNG** | Unified search/crawl API with more operational dependencies | Optional benchmark if complex multi-page crawling warrants a heavier stack; do not use hosted Firecrawl |
+| **Playwright CLI / self-hosted Playwright MCP** | Interactive browser workflows | Separate restricted browser worker pool, not the ultralight command microVM |
+| **YaCy / self-maintained web index** | Independent web indexing | Out of scope for the confirmed requirement |
+
+Prefer a small internal **Web Research Gateway** with native HTTP handlers behind the shared Tool Router, adding a self-hosted MCP interface where advantageous for Copilot SDK interoperability. MCP is a protocol choice, not a requirement to insert a server hop for every tool. Normalize results across frameworks with source URL, title, publication/retrieval timestamps where available, engine attribution, extraction method, document ID and truncation indicators.
+
+### 3.5 Self-hosted web MVP acceptance criteria
+
+1. Deploy private SearXNG with JSON enabled, configured for approved engines through the corporate proxy. Evaluate search coverage, blocking, relevance and p50/p95 response times on realistic developer and Spanish-language queries.
+2. Offer `web_search`, `web_fetch` and `web_find` through the shared router to both LangGraph and Copilot SDK. Keep full fetched documents in bounded, scoped server-side storage and return citation-ready excerpts.
+3. Use HTTP + Trafilatura first; only fall back to Crawl4AI for dynamic pages; reuse existing Docling for PDFs. Benchmark extraction accuracy, end-to-end latency, memory and browser concurrency.
+4. Enforce tool-level user authorization, quotas, timeouts, cancellation and logging. Validate SSRF, DNS rebinding, redirects, prohibited IP ranges, metadata endpoints, outbound proxy bypass and prompt-injection boundaries. Do not grant microVMs direct Internet access to enable web research.
+5. Exercise 10/50/100 concurrent calls, cache reuse, engine backoff and failure isolation. Add interactive browser workers only where necessary.
+6. Time-box a searxNcrawl trial before building custom MCP glue, but do not adopt it without reviewing provider defaults, version pinning, Chromium provisioning and production security controls.
 
 ## 4. Client-side tools
 
@@ -328,7 +356,7 @@ An agent can search for public market data through the server-side web MCP, proc
 
 ## 9. Incremental implementation plan
 
-1. **Internal web MVP:** Deploy the web MCP, SearXNG and an HTML extractor. Validate corporate proxy authentication, CA trust, permitted search engines and PDF retrieval.
+1. **Internal web MVP:** Deploy private SearXNG with JSON enabled, HTTP + Trafilatura, Crawl4AI fallback and the internal Web Research Gateway. Validate the corporate proxy, CA trust, permitted search engines, PDF retrieval and default-deny egress. Compare searxNcrawl for the optional MCP interface.
 2. **Shared tool registry:** Normalize schemas, permission policies and execution locations across LangGraph and Copilot SDK.
 3. **Client dispatch:** Extend the existing client-tool protocol with correlation IDs, scoped authorization, timeouts, cancellation and artifact handling.
 4. **Structured file tools:** Implement workbook inspection, reading and writing before introducing arbitrary code execution.
@@ -338,8 +366,9 @@ An agent can search for public market data through the server-side web MCP, proc
 
 ## 10. Decisions and open questions
 
-- **Recommended default:** Internal MCP for centralized web research; existing client-tool protocol for local operations; a separate sandbox for generated code.
-- **Network:** Can backend containers reach an approved corporate proxy? Which external search engines and websites are allowed?
+- **Confirmed (2026-11-08):** All web-research infrastructure, MCP servers, crawlers, browser services and caches are self-hosted. Public engines/sites may be queried through approved outbound proxy egress. No externally hosted search/crawl/MCP API and no independent indexing requirement.
+- **Recommended default:** Internal Web Research Gateway (native HTTP with optional self-hosted MCP) for centralized web research; existing client-tool protocol for local operations; a separate sandbox for generated code.
+- **Network:** Can service hosts reach an approved corporate proxy? Which external search engines and sites are permitted?
 - **Client type:** Is the portal strictly browser-based, or can a managed local companion be installed?
 - **Runtime:** Are rootless Podman or another approved sandbox available on client machines?
 - **Data handling:** Which file categories may be uploaded into server-side workspaces?
@@ -347,6 +376,10 @@ An agent can search for public market data through the server-side web MCP, proc
 - **Scale:** What concurrency and latency targets should govern search backends, browser workers and code sandboxes?
 
 ## References
+
+- [Trafilatura extraction documentation](https://trafilatura.readthedocs.io/en/latest/corefunctions.html)
+- [searxNcrawl (PoC candidate)](https://github.com/DasDigitaleMomentum/searxNcrawl)
+- [Firecrawl self-hosting (alternative)](https://docs.firecrawl.dev/contributing/self-host)
 
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [SearXNG search API](https://docs.searxng.org/dev/search_api.html)
